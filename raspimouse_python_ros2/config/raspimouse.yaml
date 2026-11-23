@@ -1,0 +1,28 @@
+raspimouse:
+  ros__parameters:
+    # Hardware
+    use_pulse_counters: true          # false for models before V3
+    use_battery_monitor: true         # false for models before V3
+    initial_motor_power: false
+
+    # Drive (defaults of raspimouse_python_driver / rt-net/raspimouse2)
+    wheel_diameter: 0.048             # [m]
+    wheel_tread: 0.0925               # [m]
+    pulses_per_revolution: 400.0
+    odometry_scale_left_wheel: 1.0
+    odometry_scale_right_wheel: 1.0
+    max_wheel_frequency: 1000.0       # [Hz] about 0.38 m/s
+    max_wheel_acceleration: 2000.0    # [Hz/s]
+    cmd_vel_timeout: 0.5              # [s] stop when cmd_vel stops; 0 disables
+
+    # Topics
+    use_stamped_cmd_vel: true         # geometry_msgs/TwistStamped (false: Twist)
+    odom_frame_id: odom
+    odom_child_frame_id: base_footprint
+    publish_tf: true
+
+    # Publish rates [Hz]; 0 disables the topic
+    odom_hz: 50.0
+    light_sensors_hz: 30.0
+    switches_hz: 10.0
+    battery_hz: 1.0

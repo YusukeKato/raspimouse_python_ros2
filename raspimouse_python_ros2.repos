@@ -1,0 +1,5 @@
+repositories:
+  raspimouse_python_driver:
+    type: git
+    url: https://github.com/YusukeKato/raspimouse_python_driver.git
+    version: main
