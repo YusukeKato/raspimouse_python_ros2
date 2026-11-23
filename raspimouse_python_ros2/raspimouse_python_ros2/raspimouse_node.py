@@ -25,6 +25,7 @@ import rclpy
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
+from rclpy.impl.implementation_singleton import rclpy_implementation as _rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import BatteryState
 from std_msgs.msg import Int16
@@ -44,6 +45,7 @@ from .parameters import declare_and_read
 CHECK_HINT = 'run "raspimouse-cli check" to find setup problems'
 # Rate of the velocity commands while an action runs [Hz].
 MOTION_RATE_HZ = 50.0
+RCLError = _rclpy.RCLError
 
 
 def _logs_device_errors(callback: Callable) -> Callable:
@@ -93,6 +95,9 @@ class RaspiMouseNode(Node):
         self.motion_limits = MotionLimits.from_drive_config(self.params.driver.drive)
         self._motion_lock = threading.Lock()
         self._motion_busy = False
+        self._motion_idle = threading.Event()
+        self._motion_idle.set()
+        self._released = False   # set by destroy_node: no more goals
         action_group = ReentrantCallbackGroup()
         self._action_servers = [
             ActionServer(self, DriveDistance, 'drive_distance', self.execute_drive_distance,
@@ -185,10 +190,13 @@ class RaspiMouseNode(Node):
         if error is None and not self.mouse.motor_power.is_on:
             error = 'the motor power is off'
         with self._motion_lock:
+            if error is None and self._released:
+                error = 'the node stops'
             if error is None and self._motion_busy:
                 error = 'another goal is running'
             if error is None:
                 self._motion_busy = True   # reserved until the goal ends
+                self._motion_idle.clear()
         if error is not None:
             self.get_logger().warning(f'{name}: goal rejected: {error}')
             return GoalResponse.REJECT
@@ -227,34 +235,53 @@ class RaspiMouseNode(Node):
         try:
             while True:
                 if goal_handle.is_cancel_requested:
-                    self._stop_and_settle(motion)
-                    goal_handle.canceled()
-                    return result(False, 'canceled')
-                if not rclpy.ok(context=self.context) or not self.mouse.motor_power.is_on:
-                    self._stop_and_settle(motion)
-                    goal_handle.abort()
-                    return result(False, 'the motor power was turned off or the node stops')
+                    return self._end_motion(motion, goal_handle.canceled, result, False,
+                                            'canceled')
+                if (self._released or not rclpy.ok(context=self.context)
+                        or not self.mouse.motor_power.is_on):
+                    return self._end_motion(motion, goal_handle.abort, result, False,
+                                            'the motor power was turned off or the node stops')
                 command = motion.step(drive.odometry())
                 if command is None:
                     break
                 drive.set_velocity(*command)
-                goal_handle.publish_feedback(feedback())
+                self._call_action_server(goal_handle.publish_feedback, feedback())
                 time.sleep(period)
-            self._stop_and_settle(motion)
-            goal_handle.succeed()
             self.get_logger().info(f'{name}: done')
-            return result(True, 'reached the target')
+            return self._end_motion(motion, goal_handle.succeed, result, True,
+                                    'reached the target')
         except RaspiMouseError as e:
             self.get_logger().error(f'{name}: {e}')
             try:
                 drive.stop()
             except RaspiMouseError:
                 pass
-            goal_handle.abort()
+            self._call_action_server(goal_handle.abort)
             return result(False, str(e))
         finally:
             with self._motion_lock:
                 self._motion_busy = False
+                self._motion_idle.set()
+
+    def _end_motion(self, motion, end_goal, result, success, message):
+        """Stop, set the goal state with end_goal and return the result."""
+        self._stop_and_settle(motion)
+        self._call_action_server(end_goal)
+        return result(success, message)
+
+    def _call_action_server(self, function: Callable, *args) -> None:
+        """
+        Call a goal handle method that publishes (feedback or a state change).
+
+        Once ROS shuts down (SIGINT or SIGTERM on Jazzy) the publishers are
+        gone and the call fails. The goal state is still updated before the
+        status is published, so the failure is ignored then.
+        """
+        try:
+            function(*args)
+        except RCLError:
+            if rclpy.ok(context=self.context):
+                raise
 
     def _stop_and_settle(self, motion) -> None:
         """Slow down to a stop and measure the final progress."""
@@ -299,15 +326,27 @@ class RaspiMouseNode(Node):
             self.mouse.battery.read_voltage(), self.get_clock().now().to_msg()))
 
     def destroy_node(self) -> None:
-        """Stop the motors, cut their power and release the hardware."""
+        """End a running goal, stop the motors, cut their power and release the hardware."""
+        try:
+            with self._motion_lock:
+                released, self._released = self._released, True
+            if not released:
+                self._release_hardware()
+        finally:
+            super().destroy_node()
+
+    def _release_hardware(self) -> None:
+        # A running goal sees _released, slows down to a stop and ends. Newer
+        # rclpy (not Jazzy) calls destroy_node at shutdown before the context
+        # becomes invalid, so the goal can still report its result then.
+        if not self._motion_idle.wait(timeout=5.0):
+            self.get_logger().warning('the running goal did not end; closing the hardware anyway')
         try:
             self.mouse.close()
             self.get_logger().info('released the hardware (motors stopped, motor power off)')
         except RaspiMouseError as e:
             # Everything is released even then; report and go on shutting down.
             self.get_logger().error(f'error while closing the hardware: {e}')
-        finally:
-            super().destroy_node()
 
 
 def main(args: list[str] | None = None) -> int:

@@ -1,5 +1,7 @@
 import math
 import threading
+import time
+from unittest import mock
 
 from geometry_msgs.msg import TwistStamped
 import pytest
@@ -127,3 +129,37 @@ def test_motor_power_off_aborts(system):
     result = wait(handle.get_result_async()).result
     assert not result.success
     assert 'motor power' in result.message
+
+
+def test_shutdown_during_a_goal_stops_quietly(system):
+    node, client, _ = system
+    power_on(node)
+    handle = send(client, DriveDistance, 'drive_distance',
+                  DriveDistance.Goal(distance=1.0, speed=0.15))
+    assert handle.accepted
+    # Newer rclpy (not Jazzy) also destroys the node at shutdown, which closes the hardware.
+    drive = node.mouse.drive
+    # rclpy prints a traceback when the execute callback raises.
+    with mock.patch('rclpy.action.server.traceback.print_exc') as print_exc:
+        rclpy.shutdown()          # what SIGINT / SIGTERM does
+        deadline = time.monotonic() + 5.0
+        while node._motion_busy and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.2)           # let rclpy finish the goal
+    assert not node._motion_busy
+    assert drive.wheel_frequencies == (0.0, 0.0)
+    print_exc.assert_not_called()
+
+
+def test_destroy_during_a_goal_ends_it_before_closing(system):
+    node, client, _ = system
+    power_on(node)
+    handle = send(client, DriveDistance, 'drive_distance',
+                  DriveDistance.Goal(distance=1.0, speed=0.15))
+    assert handle.accepted
+    drive, close = node.mouse.drive, node.mouse.close
+    busy_at_close = []
+    node.mouse.close = lambda: (busy_at_close.append(node._motion_busy), close())
+    node.destroy_node()
+    assert busy_at_close == [False]
+    assert drive.wheel_frequencies == (0.0, 0.0)
