@@ -2,7 +2,7 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>raspimouse_python_msgs</name>
-  <version>0.0.0</version>
+  <version>1.0.0</version>
   <description>Actions for raspimouse_python_ros2 (drive a distance, rotate by an angle).</description>
   <maintainer email="yusukekato.contact@gmail.com">YusukeKato</maintainer>
   <license>MIT</license>
