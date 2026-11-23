@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint-and-build:
+    runs-on: ubuntu-24.04
+    container: ros:jazzy-ros-base
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: src/raspimouse_python_ros2
+
+      - name: Import the driver
+        run: vcs import src < src/raspimouse_python_ros2/raspimouse_python_ros2.repos
+
+      - name: Install dependencies
+        run: |
+          apt-get update
+          rosdep update --rosdistro jazzy
+          rosdep install --from-paths src --ignore-src -y --rosdistro jazzy
+
+      - name: Lint (flake8, pep257)
+        working-directory: src/raspimouse_python_ros2/raspimouse_python_ros2
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          ament_flake8
+          ament_pep257 . test
+
+      - name: Build
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          colcon build --event-handlers console_cohesion+
