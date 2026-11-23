@@ -1,0 +1,12 @@
+# Rotate in place by an angle at a constant angular speed, then stop.
+# The motor power must be on. While the goal runs, cmd_vel is ignored.
+
+float64 angle           # [rad] positive is counterclockwise; may exceed 2 pi
+float64 angular_speed   # [rad/s] greater than 0
+---
+bool success
+float64 rotated         # [rad] positive is counterclockwise
+string message
+---
+float64 rotated         # [rad]
+float64 remaining       # [rad]

@@ -2,22 +2,29 @@
 ROS 2 node for Raspberry Pi Mouse.
 
 Publishes odom (+ TF), light_sensors, switches and battery; subscribes to
-cmd_vel, leds and buzzer; offers the motor_power service. Topic names and
-types follow rt-net/raspimouse2.
+cmd_vel, leds and buzzer; offers the motor_power service and the
+drive_distance and rotate actions. Topic names and types follow
+rt-net/raspimouse2.
 """
 
 from collections.abc import Callable
+import dataclasses
 import functools
 import signal
 import sys
+import threading
+import time
 
 from geometry_msgs.msg import Twist, TwistStamped
 from nav_msgs.msg import Odometry as OdometryMsg
 from raspimouse_msgs.msg import Leds, LightSensors, Switches
 from raspimouse_python_driver import RaspiMouse, RaspiMouseError
 from raspimouse_python_driver.hal.mock import MockBackend
+from raspimouse_python_msgs.action import DriveDistance, Rotate
 import rclpy
-from rclpy.executors import ExternalShutdownException
+from rclpy.action import ActionServer, CancelResponse, GoalResponse
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import BatteryState
 from std_msgs.msg import Int16
@@ -31,9 +38,12 @@ from .conversions import (
     odometry_to_transform,
     switches_to_msg,
 )
+from .motion import check_goal, MotionLimits, RotationMotion, StraightMotion
 from .parameters import declare_and_read
 
 CHECK_HINT = 'run "raspimouse-cli check" to find setup problems'
+# Rate of the velocity commands while an action runs [Hz].
+MOTION_RATE_HZ = 50.0
 
 
 def _logs_device_errors(callback: Callable) -> Callable:
@@ -61,8 +71,12 @@ class RaspiMouseNode(Node):
         super().__init__('raspimouse', **kwargs)
         self.params = declare_and_read(self)
         if mouse is None:
-            backend = MockBackend() if self.params.use_mock_backend else None
-            mouse = RaspiMouse(self.params.driver, backend)
+            config, backend = self.params.driver, None
+            if self.params.use_mock_backend:
+                # Fake pulse counters never count: estimate the odometry from the commands.
+                config = dataclasses.replace(config, has_pulse_counters=False)
+                backend = MockBackend()
+            mouse = RaspiMouse(config, backend)
         self.mouse = mouse
         self.mouse.open()
         if self.params.initial_motor_power:
@@ -74,6 +88,22 @@ class RaspiMouseNode(Node):
         self.create_subscription(Leds, 'leds', self.on_leds, 10)
         self.create_subscription(Int16, 'buzzer', self.on_buzzer, 10)
         self.create_service(SetBool, 'motor_power', self.on_motor_power)
+
+        # Actions. They run in their own threads (MultiThreadedExecutor), one goal at a time.
+        self.motion_limits = MotionLimits.from_drive_config(self.params.driver.drive)
+        self._motion_lock = threading.Lock()
+        self._motion_busy = False
+        action_group = ReentrantCallbackGroup()
+        self._action_servers = [
+            ActionServer(self, DriveDistance, 'drive_distance', self.execute_drive_distance,
+                         goal_callback=self.on_drive_distance_goal,
+                         cancel_callback=lambda _: CancelResponse.ACCEPT,
+                         callback_group=action_group),
+            ActionServer(self, Rotate, 'rotate', self.execute_rotate,
+                         goal_callback=self.on_rotate_goal,
+                         cancel_callback=lambda _: CancelResponse.ACCEPT,
+                         callback_group=action_group),
+        ]
 
         # Inputs
         p = self.params
@@ -99,6 +129,10 @@ class RaspiMouseNode(Node):
     def on_cmd_vel(self, msg: Twist | TwistStamped) -> None:
         """Set the target velocity. Repeat at least every cmd_vel_timeout seconds."""
         twist = msg.twist if isinstance(msg, TwistStamped) else msg
+        if self._motion_busy:
+            self.get_logger().warning('cmd_vel ignored while an action goal runs',
+                                      throttle_duration_sec=5.0)
+            return
         if not self.mouse.motor_power.is_on:
             self.get_logger().warning('cmd_vel received while the motor power is off',
                                       throttle_duration_sec=5.0)
@@ -136,6 +170,102 @@ class RaspiMouseNode(Node):
         response.message = f'motor power {"on" if request.data else "off"}'
         self.get_logger().info(response.message)
         return response
+
+    # --- Actions -----------------------------------------------------------
+
+    def on_drive_distance_goal(self, goal: DriveDistance.Goal) -> GoalResponse:
+        """Accept a valid goal while the motor power is on and no other goal runs."""
+        return self._accept_goal('drive_distance', check_goal(goal.distance, goal.speed))
+
+    def on_rotate_goal(self, goal: Rotate.Goal) -> GoalResponse:
+        """Accept a valid goal while the motor power is on and no other goal runs."""
+        return self._accept_goal('rotate', check_goal(goal.angle, goal.angular_speed))
+
+    def _accept_goal(self, name: str, error: str | None) -> GoalResponse:
+        if error is None and not self.mouse.motor_power.is_on:
+            error = 'the motor power is off'
+        with self._motion_lock:
+            if error is None and self._motion_busy:
+                error = 'another goal is running'
+            if error is None:
+                self._motion_busy = True   # reserved until the goal ends
+        if error is not None:
+            self.get_logger().warning(f'{name}: goal rejected: {error}')
+            return GoalResponse.REJECT
+        return GoalResponse.ACCEPT
+
+    def execute_drive_distance(self, goal_handle) -> DriveDistance.Result:
+        """Drive the requested distance, then stop."""
+        goal = goal_handle.request
+        motion = StraightMotion(goal.distance, goal.speed, self.mouse.drive.odometry(),
+                                self.motion_limits)
+
+        def feedback():
+            return DriveDistance.Feedback(traveled=motion.traveled, remaining=motion.remaining)
+
+        def result(success, message):
+            return DriveDistance.Result(success=success, traveled=motion.traveled,
+                                        message=message)
+        return self._run_motion('drive_distance', goal_handle, motion, feedback, result)
+
+    def execute_rotate(self, goal_handle) -> Rotate.Result:
+        """Rotate by the requested angle, then stop."""
+        goal = goal_handle.request
+        motion = RotationMotion(goal.angle, goal.angular_speed, self.mouse.drive.odometry(),
+                                self.motion_limits)
+
+        def feedback():
+            return Rotate.Feedback(rotated=motion.rotated, remaining=motion.remaining)
+
+        def result(success, message):
+            return Rotate.Result(success=success, rotated=motion.rotated, message=message)
+        return self._run_motion('rotate', goal_handle, motion, feedback, result)
+
+    def _run_motion(self, name, goal_handle, motion, feedback, result):
+        drive = self.mouse.drive
+        period = 1.0 / MOTION_RATE_HZ
+        try:
+            while True:
+                if goal_handle.is_cancel_requested:
+                    self._stop_and_settle(motion)
+                    goal_handle.canceled()
+                    return result(False, 'canceled')
+                if not rclpy.ok(context=self.context) or not self.mouse.motor_power.is_on:
+                    self._stop_and_settle(motion)
+                    goal_handle.abort()
+                    return result(False, 'the motor power was turned off or the node stops')
+                command = motion.step(drive.odometry())
+                if command is None:
+                    break
+                drive.set_velocity(*command)
+                goal_handle.publish_feedback(feedback())
+                time.sleep(period)
+            self._stop_and_settle(motion)
+            goal_handle.succeed()
+            self.get_logger().info(f'{name}: done')
+            return result(True, 'reached the target')
+        except RaspiMouseError as e:
+            self.get_logger().error(f'{name}: {e}')
+            try:
+                drive.stop()
+            except RaspiMouseError:
+                pass
+            goal_handle.abort()
+            return result(False, str(e))
+        finally:
+            with self._motion_lock:
+                self._motion_busy = False
+
+    def _stop_and_settle(self, motion) -> None:
+        """Slow down to a stop and measure the final progress."""
+        drive = self.mouse.drive
+        drive.stop()
+        deadline = time.monotonic() + 3.0
+        while drive.wheel_frequencies != (0.0, 0.0) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        # Let the odometry take in the last pulses (two control cycles).
+        time.sleep(2.0 / self.params.driver.drive.control_rate_hz)
+        motion.update(drive.odometry())
 
     # --- Timers ------------------------------------------------------------
 
@@ -190,8 +320,10 @@ def main(args: list[str] | None = None) -> int:
             f'cannot open the hardware: {e}; {CHECK_HINT}')
         rclpy.try_shutdown()
         return 1
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     except Exception:
@@ -204,6 +336,7 @@ def main(args: list[str] | None = None) -> int:
         # hardware, or the motors could keep running.
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        executor.shutdown(timeout_sec=3.0)
         node.destroy_node()
         rclpy.try_shutdown()
     return 0

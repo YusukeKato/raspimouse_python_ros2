@@ -1,0 +1,12 @@
+# Drive straight for a distance at a constant speed, then stop.
+# The motor power must be on. While the goal runs, cmd_vel is ignored.
+
+float64 distance   # [m] negative drives backward
+float64 speed      # [m/s] greater than 0
+---
+bool success
+float64 traveled   # [m] along the start heading, negative when backward
+string message
+---
+float64 traveled   # [m]
+float64 remaining  # [m]

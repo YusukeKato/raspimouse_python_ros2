@@ -2,6 +2,9 @@
 
 ROS 2 node for Raspberry Pi Mouse, built on [raspimouse_python_driver](https://github.com/YusukeKato/raspimouse_python_driver).
 
+- `raspimouse_python_ros2`: the node (topics, service, actions)
+- `raspimouse_python_msgs`: the action definitions
+
 This is an unofficial package developed by volunteers.
 Topic names and types follow the official [rt-net/raspimouse2](https://github.com/rt-net/raspimouse2).
 
@@ -46,6 +49,19 @@ ros2 topic pub -r 10 /cmd_vel geometry_msgs/msg/TwistStamped "{twist: {linear: {
 ```
 
 The robot stops when `cmd_vel` stops for `cmd_vel_timeout` (0.5 s).
+
+Drive 0.3 m forward at 0.15 m/s, then turn 90 degrees to the left, and stop at the targets:
+
+```bash
+ros2 action send_goal --feedback /drive_distance raspimouse_python_msgs/action/DriveDistance "{distance: 0.3, speed: 0.15}"
+```
+
+```bash
+ros2 action send_goal --feedback /rotate raspimouse_python_msgs/action/Rotate "{angle: 1.5708, angular_speed: 3.14}"
+```
+
+Goals are rejected while the motor power is off or another goal runs; `cmd_vel` is ignored while a goal runs.
+
 To try the node on a PC without the robot, add `use_mock_backend:=true` to the launch command.
 
 ## Interfaces
@@ -56,6 +72,8 @@ To try the node on a PC without the robot, add `use_mock_backend:=true` to the l
 | `leds` | raspimouse_msgs/Leds | subscribed |
 | `buzzer` | std_msgs/Int16 (Hz, 0 stops) | subscribed |
 | `motor_power` | std_srvs/SetBool | service |
+| `drive_distance` | raspimouse_python_msgs/DriveDistance (distance [m], speed [m/s]) | action |
+| `rotate` | raspimouse_python_msgs/Rotate (angle [rad], angular_speed [rad/s]) | action |
 | `odom` | nav_msgs/Odometry, and TF `odom` -> `base_footprint` | published |
 | `light_sensors` | raspimouse_msgs/LightSensors | published |
 | `switches` | raspimouse_msgs/Switches | published |
